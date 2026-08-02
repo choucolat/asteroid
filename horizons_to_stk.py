@@ -86,6 +86,12 @@ _MONTHS = {
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 }
 
+#: TDB - UTC in seconds. TT - TAI = 32.184 s by definition, TAI - UTC = 37 s
+#: since the 2017-01-01 leap second, and TDB - TT is periodic with amplitude
+#: 1.7 ms. No leap second is scheduled inside the 2023-2029 span covered here,
+#: so this is a constant.
+TDB_MINUS_UTC_SECONDS = 69.184
+
 
 def horizons_calendar_to_datetime(cal: str) -> datetime:
     """'2023-Jan-01 00:00:00.0000' -> datetime (naive; treated as TDB,
@@ -113,27 +119,35 @@ def write_stk_ephemeris_file(
     points: list[EphemPoint],
     out_path: str,
     central_body: str = "Sun",
-    coord_system: str = "J2000",
+    coord_system: str = "ICRF",
     interpolation_order: int = 5,
 ) -> None:
     """Write an STK .e (EphemerisTimePosVel) file from parsed Horizons points.
 
-    Note on time system: Horizons vectors here are tagged TDB. STK's .e
-    ScenarioEpoch/date fields are UTCG. TDB-UTC differs by ~69 seconds
-    (as of the 2020s) and drifts extremely slowly -- negligible next to
-    the 10-day sampling used for this porkchop, so the TDB calendar
-    string is written directly as if it were UTCG. If sub-minute
-    accuracy in the epoch mattered for your application you'd want to
-    apply that ~69 s correction explicitly.
+    Note on time system: Horizons vectors here are tagged TDB, while STK's .e
+    ScenarioEpoch is UTCG. The two differ by TDB_MINUS_UTC_SECONDS, which is
+    constant over this span, so the correction applies to ScenarioEpoch alone --
+    the elapsed-seconds column is a difference and is unaffected. At 2024 YR4's
+    ~30 km/s that 69 s is worth ~2000 km of along-track position, so it is worth
+    applying even though it is small next to the 10-day sampling.
+
+    Note on frame: Horizons was queried with REF_PLANE='FRAME', i.e. ICRF, which
+    is what the porkchop script's ``Cartesian Position/ICRF`` data provider also
+    asks for. ICRF and J2000 differ only by the ~23 mas frame bias (~70 km at
+    4 AU); pass ``coord_system="J2000"`` if an older STK build rejects ICRF for
+    a Sun-centred ephemeris.
     """
     points = sorted(points, key=lambda p: p.jd_tdb)
-    epoch_dt = horizons_calendar_to_datetime(points[0].calendar)
+    # Elapsed seconds are differences of TDB tags, so they are measured against
+    # the TDB epoch; only the ScenarioEpoch written to the header is converted.
+    epoch_tdb = horizons_calendar_to_datetime(points[0].calendar)
+    epoch_utc = epoch_tdb - timedelta(seconds=TDB_MINUS_UTC_SECONDS)
 
     lines = []
     lines.append("stk.v.11.0")
     lines.append("BEGIN Ephemeris")
     lines.append(f"NumberOfEphemerisPoints {len(points)}")
-    lines.append(f"ScenarioEpoch {format_utcg(epoch_dt)}")
+    lines.append(f"ScenarioEpoch {format_utcg(epoch_utc)}")
     lines.append(f"CentralBody {central_body}")
     lines.append(f"CoordinateSystem {coord_system}")
     lines.append("InterpolationMethod Lagrange")
@@ -142,7 +156,7 @@ def write_stk_ephemeris_file(
     lines.append("EphemerisTimePosVel")
     for p in points:
         dt = horizons_calendar_to_datetime(p.calendar)
-        t_sec = (dt - epoch_dt).total_seconds()
+        t_sec = (dt - epoch_tdb).total_seconds()
         lines.append(
             f"{t_sec:.6f} {p.x:.9E} {p.y:.9E} {p.z:.9E} "
             f"{p.vx:.9E} {p.vy:.9E} {p.vz:.9E}"

@@ -1,9 +1,9 @@
 stk.v.11.0
 BEGIN Ephemeris
 NumberOfEphemerisPoints 256
-ScenarioEpoch 1 Jan 2023 00:00:00.000000000
+ScenarioEpoch 31 Dec 2022 23:58:50.816000000
 CentralBody Sun
-CoordinateSystem J2000
+CoordinateSystem ICRF
 InterpolationMethod Lagrange
 InterpolationOrder 5
 DistanceUnit Kilometers
