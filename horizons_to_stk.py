@@ -38,6 +38,23 @@ class EphemPoint:
     vz: float
 
 
+def parse_horizons_target_name(path: str) -> str | None:
+    """Pull the ``Target body name:`` line out of a Horizons text file.
+
+    Returns e.g. ``"(2024 YR4)"``, or ``None`` if the file doesn't have the
+    usual Horizons header (e.g. a hand-trimmed vector table).
+    """
+    with open(path, "r") as f:
+        for line in f:
+            if line.startswith("Target body name:"):
+                rest = line[len("Target body name:"):]
+                # Drop the trailing "{source: ...}" annotation, if present.
+                return rest.split("{")[0].strip()
+            if "$$SOE" in line:
+                break
+    return None
+
+
 def parse_horizons_vectors(path: str) -> list[EphemPoint]:
     """Parse the $$SOE / $$EOE vector block of a Horizons Type-3 text file.
 
