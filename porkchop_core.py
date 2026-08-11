@@ -428,6 +428,95 @@ def launch_reachable(dla_deg: np.ndarray, inclination_deg: float) -> np.ndarray:
     return np.abs(dla_deg) <= abs(inclination_deg)
 
 
+# ---------------------------------------------------------------------------
+# Sun-Earth L2 departure (Tier 1 approximation -- see the L2 conversation)
+# ---------------------------------------------------------------------------
+# A real L2 "parking orbit" is a halo/Lissajous orbit held in place by the
+# combined Sun+Earth gravity -- a restricted three-body (CR3BP) solution,
+# genuinely different physics from everything else in this module. Building
+# that properly (numerically integrated CR3BP, differential-corrected halo
+# families, invariant-manifold departure trajectories) was scoped as
+# "Tier 2" and explicitly set aside as a separate, much larger project.
+#
+# What's implemented here instead ("Tier 1") treats L2 as a point that
+# simply rides along with Earth: offset outward from Earth by the standard
+# first-order collinear-libration-point distance, with the *same* heliocentric
+# velocity as Earth (a "co-moving" approximation -- it ignores the halo
+# orbit's own small periodic motion relative to Earth, which is negligible
+# next to interplanetary transfer speeds, but it also means this cannot see
+# the low-energy manifold departures that are the actual reason real
+# missions use L2 staging). Treat the departure costs computed this way as
+# "roughly what a heliocentric transfer costs from L2's neighbourhood," not
+# as a substitute for real three-body mission design.
+#
+# Because L2 has no deep gravity well to climb out of the way LEO does,
+# there's no Oberth-boosted injection-burn formula here (contrast
+# injection_dv above): the departure delta-v from L2's vicinity is just the
+# direct vector difference between the desired heliocentric departure
+# velocity and L2's own heliocentric velocity -- which is exactly what
+# solve_porkchop's existing dv_departure/v_inf_departure computation already
+# gives you, provided it's handed L2's position/velocity instead of Earth's.
+# That's why L2Ephemeris below is built to be a drop-in replacement for a
+# SunCentredEphemeris in solve_porkchop -- no separate departure-cost
+# function is needed.
+
+#: Approximate impulsive delta-v (km/s) to go from a ~200 km LEO parking
+#: orbit to insertion onto a Sun-Earth L2 transfer trajectory -- i.e. the
+#: cost of "getting to the depot" before any interplanetary departure burn
+#: is even considered. This is a representative fixed value from real L2
+#: missions (JWST, Gaia, WMAP all used approximately this much), not a
+#: number derived from the CR3BP dynamics -- getting the real, date- and
+#: trajectory-dependent number needs the Tier 2 machinery this module
+#: doesn't implement. Treat it as a rough constant, not asteroid- or
+#: date-dependent.
+LEO_TO_L2_DV_KM_S = 3.2
+
+
+def l2_offset(
+    r_earth: np.ndarray,
+    v_earth: np.ndarray,
+    mu_sun: float = MU_SUN,
+    mu_earth: float = MU_EARTH,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Approximate Sun-Earth L2 position/velocity (heliocentric, km, km/s),
+    given Earth's own heliocentric state, via the standard first-order
+    collinear-libration-point distance formula
+    ``d = r * (mu_earth / (3 * mu_sun)) ** (1/3)``, applied radially outward
+    along the Sun-Earth line, with L2 assumed to share Earth's velocity (see
+    the module note above for what this approximation does and doesn't
+    capture).
+    """
+    r_earth = np.asarray(r_earth, dtype=float)
+    v_earth = np.asarray(v_earth, dtype=float)
+    alpha = (mu_earth / (3.0 * mu_sun)) ** (1.0 / 3.0)
+    r_l2 = r_earth * (1.0 + alpha)
+    v_l2 = v_earth
+    return r_l2, v_l2
+
+
+class L2Ephemeris:
+    """Approximate Sun-Earth L2 point, riding along with an existing Earth
+    ``SunCentredEphemeris``. Exposes the same ``state(jd)`` / ``jd_start`` /
+    ``jd_stop`` interface, so it's a drop-in replacement for
+    ``departure_ephem`` in ``solve_porkchop`` -- see ``l2_offset`` for the
+    approximation this relies on, and the module note above for its limits
+    (Tier 1, not real CR3BP halo-orbit dynamics).
+    """
+
+    def __init__(self, earth: SunCentredEphemeris):
+        self.earth = earth
+        self.name = "Sun-Earth L2 (Tier 1 approx.)"
+        self.jd_start = earth.jd_start
+        self.jd_stop = earth.jd_stop
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<L2Ephemeris riding on {self.earth!r}>"
+
+    def state(self, jd) -> tuple[np.ndarray, np.ndarray]:
+        r_e, v_e = self.earth.state(jd)
+        return l2_offset(r_e, v_e)
+
+
 def b_plane_offset(v_inf: np.ndarray, standoff_km: float) -> np.ndarray:
     """Return a B-plane offset vector of magnitude ``standoff_km``.
 

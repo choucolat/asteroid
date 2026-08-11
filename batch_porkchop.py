@@ -60,6 +60,21 @@ object has fewer than two close approaches inside its downloaded
 ephemeris span, period 2 is capped at the ephemeris's own end instead of
 a real second approach (flagged in the output); if it has none at all,
 the statistic is reported as unavailable rather than guessed at.
+
+L2 departure comparison
+------------------------
+Alongside the LEO parking-orbit analysis, also reports the departure cost
+from Sun-Earth L2 for each asteroid, and which staging point comes out
+cheaper overall. This uses the Tier 1 approximation described in
+porkchop_core.py (L2 treated as a point co-moving with Earth, offset by
+the standard collinear-libration-point distance) -- it is NOT a real
+three-body/CR3BP halo-orbit analysis, and in particular cannot see the
+low-energy manifold departures that are the actual reason real missions
+stage at L2. The "total via L2" figure adds a fixed, approximate
+LEO-to-L2 transfer cost (porkchop_core.LEO_TO_L2_DV_KM_S, ~3.2 km/s,
+representative of real L2 missions) on top of the L2 departure burn, so
+it's a fair-ish total-mission comparison against departing directly from
+LEO -- not just a comparison of the two departure burns in isolation.
 """
 
 from __future__ import annotations
@@ -77,6 +92,8 @@ import numpy as np
 
 from horizons_to_stk import parse_horizons_target_name
 from porkchop_core import (
+    L2Ephemeris,
+    LEO_TO_L2_DV_KM_S,
     SunCentredEphemeris,
     datetime_to_jd,
     flyby_offset_closest_approach,
@@ -240,6 +257,52 @@ def parking_orbit_analysis(
     return out
 
 
+def l2_departure_analysis(
+    earth: SunCentredEphemeris,
+    ast: SunCentredEphemeris,
+    launch_jd: np.ndarray,
+    arrival_jd: np.ndarray,
+    max_tof_days: float,
+    leo_direct_dv: float,
+    leo_to_l2_dv: float = LEO_TO_L2_DV_KM_S,
+) -> dict:
+    """Compare departing from Sun-Earth L2 against departing directly from
+    LEO (``leo_direct_dv``, the LEO injection dv already computed at its own
+    best-C3 point). Solves its own Lambert grid from L2Ephemeris(earth) --
+    L2's offset position gives a slightly different optimal launch/arrival
+    date than the Earth-departure grid, so this doesn't just reuse the
+    Earth grid's optimum. See the Tier 1 caveats in porkchop_core.py: no
+    Oberth boost is modelled (L2 has no deep well to climb out of), and the
+    fixed LEO-to-L2 transfer cost is a representative constant, not derived
+    from real three-body dynamics.
+    """
+    l2 = L2Ephemeris(earth)
+    l2_res = solve_porkchop(l2, ast, launch_jd, arrival_jd)
+    l2_dv = l2_res["dv_departure"]
+    tof = l2_res["tof_days"]
+    solved = np.isfinite(l2_dv) & (tof > 0) & (tof <= max_tof_days)
+
+    if not np.any(solved):
+        return {"available": False, "note": "no feasible L2 departure transfer in the grid"}
+
+    i_l2 = np.unravel_index(np.argmin(np.where(solved, l2_dv, np.inf)), l2_dv.shape)
+    best_l2_dv = float(l2_dv[i_l2])
+    total_via_l2 = leo_to_l2_dv + best_l2_dv
+    total_via_leo = leo_direct_dv
+
+    return {
+        "available": True,
+        "best_departure_dv": best_l2_dv,
+        "best_launch": jd_to_datetime(launch_jd[i_l2[1]]),
+        "best_arrival": jd_to_datetime(arrival_jd[i_l2[0]]),
+        "leo_to_l2_dv": leo_to_l2_dv,
+        "total_via_l2": total_via_l2,
+        "total_via_leo_direct": total_via_leo,
+        "cheaper_route": "L2" if total_via_l2 < total_via_leo else "LEO",
+        "savings": abs(total_via_l2 - total_via_leo),
+    }
+
+
 #: Bar colours, reused from plot_porkchop.py's palette choices.
 COL_C3 = "#1f2937"
 COL_VINF = "#c2610c"
@@ -362,6 +425,11 @@ def analyze_asteroid(
         park_altitude_km, park_inclination_deg,
     )
 
+    out["l2_departure"] = l2_departure_analysis(
+        earth, ast, launch_jd, arrival_jd, max_tof_days,
+        leo_direct_dv=out["parking_orbit"]["injection_dv_at_best_c3"],
+    )
+
     return out
 
 
@@ -380,6 +448,8 @@ def write_csv(results: list[dict], path: str) -> None:
         "park_best_reachable_available", "park_best_reachable_launch",
         "park_best_reachable_arrival", "park_best_reachable_c3",
         "park_best_reachable_injection_dv",
+        "l2_available", "l2_best_departure_dv", "l2_best_launch", "l2_best_arrival",
+        "l2_to_l2_dv", "l2_total_via_l2", "l2_total_via_leo_direct", "l2_cheaper_route",
     ]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
@@ -387,7 +457,16 @@ def write_csv(results: list[dict], path: str) -> None:
         for r in results:
             p = r.get("next_period", {})
             po = r.get("parking_orbit", {})
+            l2 = r.get("l2_departure", {})
             flat = dict(r)
+            flat["l2_available"] = l2.get("available", False)
+            flat["l2_best_departure_dv"] = l2.get("best_departure_dv", np.nan)
+            flat["l2_best_launch"] = l2.get("best_launch")
+            flat["l2_best_arrival"] = l2.get("best_arrival")
+            flat["l2_to_l2_dv"] = l2.get("leo_to_l2_dv", np.nan)
+            flat["l2_total_via_l2"] = l2.get("total_via_l2", np.nan)
+            flat["l2_total_via_leo_direct"] = l2.get("total_via_leo_direct", np.nan)
+            flat["l2_cheaper_route"] = l2.get("cheaper_route", "")
             flat["next_period_available"] = p.get("available", False)
             flat["next_period_reference"] = p.get("reference_date")
             flat["next_period1_end"] = p.get("period1_end")
@@ -530,6 +609,41 @@ def print_parking_orbit_stats(results: list[dict]) -> None:
     )
 
 
+def print_l2_stats(results: list[dict]) -> None:
+    print(
+        f"\nSun-Earth L2 departure vs. direct LEO escape (Tier 1 approximation "
+        f"-- L2 treated as co-moving with Earth, no real halo-orbit/manifold "
+        f"dynamics; assumes {LEO_TO_L2_DV_KM_S:g} km/s to get from LEO to L2 "
+        "in the first place):"
+    )
+    hdr = (
+        f"{'asteroid':<20}{'L2 departure dv':>17}{'total via L2':>15}"
+        f"{'total via LEO':>15}{'cheaper':>10}"
+    )
+    print(hdr)
+    print("-" * len(hdr))
+    n_l2_cheaper = n_available = 0
+    for r in results:
+        l2 = r["l2_departure"]
+        if not l2.get("available"):
+            print(f"{r['name']:<20}  {l2.get('note', 'n/a')}")
+            continue
+        n_available += 1
+        n_l2_cheaper += int(l2["cheaper_route"] == "L2")
+        print(
+            f"{r['name']:<20}{l2['best_departure_dv']:>14.3f} km/s"
+            f"{l2['total_via_l2']:>12.3f} km/s"
+            f"{l2['total_via_leo_direct']:>12.3f} km/s"
+            f"{l2['cheaper_route']:>10}"
+        )
+    if n_available:
+        print(
+            f"\nL2 staging comes out cheaper for {n_l2_cheaper} of "
+            f"{n_available} evaluable candidates once the "
+            f"{LEO_TO_L2_DV_KM_S:g} km/s LEO-to-L2 cost is included."
+        )
+
+
 def plot_comparison(results: list[dict], out_path: str) -> None:
     names = [r["name"] for r in results]
     c3 = [r["int_c3"] for r in results]
@@ -650,6 +764,7 @@ def main() -> None:
     print_tof_stats(results)
     print_next_period_stats(results, args.max_c3_next_period)
     print_parking_orbit_stats(results)
+    print_l2_stats(results)
 
     csv_path = f"{args.out_prefix}.csv"
     png_path = f"{args.out_prefix}.png"
