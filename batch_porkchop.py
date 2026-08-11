@@ -43,6 +43,23 @@ asteroid_comparison.png
 Time-of-flight statistics (min/median/mean/max across the analysed batch,
 for each of the three mission types) are printed to the console after the
 per-asteroid table.
+
+"Reachable by next period" statistic
+-------------------------------------
+For the objects in PERIOD_DATA (below), also checks a discovery-latency
+question: if this object were discovered now, would a mission be able to
+reach it soon enough? Concretely: "period 1" runs from the object's
+discovery (or from whenever our ephemeris coverage begins, if that's
+later -- we can't launch before our data starts anyway) to the next real
+Earth close approach after that; "period 2" runs from there to the
+following close approach. This checks whether a launch-after-reference /
+arrival-by-end-of-period-2 transfer exists with C3 under --max-c3. Close
+approach dates come from JPL's CAD tool, not from the Lambert grid --
+they're real physical encounters, not a mission-design choice. If an
+object has fewer than two close approaches inside its downloaded
+ephemeris span, period 2 is capped at the ephemeris's own end instead of
+a real second approach (flagged in the output); if it has none at all,
+the statistic is reported as unavailable rather than guessed at.
 """
 
 from __future__ import annotations
@@ -52,6 +69,7 @@ import csv
 import datetime as dt
 import glob
 import os
+import re
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -60,6 +78,7 @@ import numpy as np
 from horizons_to_stk import parse_horizons_target_name
 from porkchop_core import (
     SunCentredEphemeris,
+    datetime_to_jd,
     flyby_offset_closest_approach,
     jd_to_datetime,
     solve_flyby_porkchop,
@@ -67,6 +86,99 @@ from porkchop_core import (
 )
 
 DAY = 86400.0
+
+# Real discovery dates (SBDB "discovery.date", or "orbit.first_obs" where no
+# formal discovery-credit record exists) and real Earth close-approach dates
+# (JPL CAD tool, dist-max 0.5-1 AU) for the 10 candidates fetched earlier in
+# this conversation. Keyed by bare designation -- see designation_key().
+# Add an entry here for any new candidate you want this statistic for.
+PERIOD_DATA: dict[str, dict] = {
+    "2024 YR4":  {"discovery": "2024-12-25", "approaches": ["2024-12-25", "2028-12-17"]},
+    "99942":     {"discovery": "2004-06-19", "approaches": ["2027-12-29", "2028-09-12", "2029-04-13", "2029-11-26"]},
+    "101955":    {"discovery": "1999-09-11", "approaches": ["2030-06-21", "2031-02-18"]},
+    "162173":    {"discovery": "1999-05-10", "approaches": ["2033-12-21"]},
+    "25143":     {"discovery": "1998-09-26", "approaches": ["2033-03-23"]},
+    "65803":     {"discovery": "1996-04-11", "approaches": []},
+    "2011 AA37": {"discovery": "2011-01-13", "approaches": ["2026-08-10"]},
+    "2012 EC":   {"discovery": "2012-03-01", "approaches": ["2028-01-10"]},
+    "2013 WA44": {"discovery": "2006-05-07", "approaches": ["2029-01-14", "2029-06-13"]},
+    "2001 CQ36": {"discovery": "2001-02-13", "approaches": ["2031-01-31", "2031-09-18"]},
+}
+
+
+def designation_key(fullname: str) -> str:
+    """Extract a bare designation from a Horizons target string, to look it
+    up in PERIOD_DATA regardless of exact formatting, e.g.
+    "99942 Apophis (2004 MN4)" -> "99942", "(2024 YR4)" -> "2024 YR4"."""
+    s = fullname.strip()
+    m = re.match(r"^\(([^)]+)\)$", s)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"^(\d+)\b", s)
+    if m:
+        return m.group(1)
+    return s
+
+
+def _parse_iso_date(s: str) -> dt.datetime:
+    return dt.datetime.strptime(s, "%Y-%m-%d")
+
+
+def next_period_reachability(
+    name: str,
+    launch_jd: np.ndarray,
+    arrival_jd: np.ndarray,
+    c3: np.ndarray,
+    tof: np.ndarray,
+    jd_lo: float,
+    jd_hi: float,
+    max_c3: float,
+) -> dict:
+    """See the "Reachable by next period" note in the module docstring."""
+    meta = PERIOD_DATA.get(designation_key(name))
+    if meta is None:
+        return {"available": False, "note": "no discovery/close-approach data on file"}
+
+    discovery_jd = datetime_to_jd(_parse_iso_date(meta["discovery"]))
+    reference_jd = max(discovery_jd, jd_lo)
+    approaches_jd = sorted(
+        datetime_to_jd(_parse_iso_date(d)) for d in meta["approaches"]
+    )
+    approaches_jd = [a for a in approaches_jd if a > reference_jd]
+
+    if not approaches_jd:
+        return {
+            "available": False,
+            "note": "no Earth close approach found within this ephemeris's coverage",
+            "reference_date": jd_to_datetime(reference_jd),
+        }
+
+    period1_end_jd = approaches_jd[0]
+    if len(approaches_jd) >= 2:
+        period2_end_jd = approaches_jd[1]
+        capped = False
+    else:
+        period2_end_jd = jd_hi
+        capped = True
+
+    mask = (
+        np.isfinite(c3)
+        & (tof > 0)
+        & (launch_jd[None, :] >= reference_jd)
+        & (arrival_jd[:, None] <= period2_end_jd)
+    )
+    reachable = bool(np.any(mask & (c3 <= max_c3)))
+    best_c3 = float(np.min(np.where(mask, c3, np.inf))) if np.any(mask) else float("nan")
+
+    return {
+        "available": True,
+        "reference_date": jd_to_datetime(reference_jd),
+        "period1_end": jd_to_datetime(period1_end_jd),
+        "period2_end": jd_to_datetime(period2_end_jd),
+        "period2_capped_by_data": capped,
+        "reachable": reachable,
+        "best_c3_in_window": best_c3,
+    }
 
 #: Bar colours, reused from plot_porkchop.py's palette choices.
 COL_C3 = "#1f2937"
@@ -99,6 +211,7 @@ def analyze_asteroid(
     step_days: float,
     min_tof_days: float,
     max_tof_days: float,
+    max_c3_next_period: float,
 ) -> dict | None:
     """Run intercept / flyby / rendezvous solves over an auto-derived grid.
 
@@ -177,6 +290,11 @@ def analyze_asteroid(
     else:
         print(f"  note {name}: no flyby transfer converged (intercept/rendezvous still valid)")
 
+    period = next_period_reachability(
+        name, launch_jd, arrival_jd, c3, tof, jd_lo, jd_hi, max_c3_next_period
+    )
+    out["next_period"] = period
+
     return out
 
 
@@ -187,14 +305,26 @@ def write_csv(results: list[dict], path: str) -> None:
         "fly_launch", "fly_arrival", "fly_vinf", "fly_tof_days",
         "fly_standoff_km", "fly_achieved_km",
         "rdv_launch", "rdv_arrival", "rdv_total_dv", "rdv_tof_days",
+        "next_period_available", "next_period_reference", "next_period1_end",
+        "next_period2_end", "next_period2_capped_by_data",
+        "next_period_reachable", "next_period_best_c3",
     ]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(fields)
         for r in results:
+            p = r.get("next_period", {})
+            flat = dict(r)
+            flat["next_period_available"] = p.get("available", False)
+            flat["next_period_reference"] = p.get("reference_date")
+            flat["next_period1_end"] = p.get("period1_end")
+            flat["next_period2_end"] = p.get("period2_end")
+            flat["next_period2_capped_by_data"] = p.get("period2_capped_by_data", "")
+            flat["next_period_reachable"] = p.get("reachable", "")
+            flat["next_period_best_c3"] = p.get("best_c3_in_window", np.nan)
             row = []
             for k in fields:
-                v = r[k]
+                v = flat.get(k)
                 if isinstance(v, dt.datetime):
                     v = v.strftime("%Y-%m-%d")
                 elif isinstance(v, float):
@@ -244,6 +374,37 @@ def print_tof_stats(results: list[dict]) -> None:
             f"{label:<14}{len(arr):>4}{arr.min():>8.0f}{np.median(arr):>8.0f}"
             f"{arr.mean():>8.0f}{arr.max():>8.0f}"
         )
+
+
+def print_next_period_stats(results: list[dict], max_c3: float) -> None:
+    print(
+        f"\nReachable by next period (launch after discovery, arrive by the "
+        f"second Earth close approach after that, C3 <= {max_c3:g} km^2/s^2):"
+    )
+    hdr = f"{'asteroid':<20}{'reference':>12}{'period 1 end':>14}{'period 2 end':>14}{'reachable':>11}"
+    print(hdr)
+    print("-" * len(hdr))
+    n_available = n_reachable = 0
+    for r in results:
+        p = r["next_period"]
+        if not p.get("available"):
+            note = p.get("note", "n/a")
+            print(f"{r['name']:<20}{'--':>12}{'--':>14}{'--':>14}  {note}")
+            continue
+        n_available += 1
+        reachable = p["reachable"]
+        n_reachable += int(reachable)
+        p2_str = p["period2_end"].strftime("%Y-%m-%d") + ("*" if p["period2_capped_by_data"] else "")
+        print(
+            f"{r['name']:<20}"
+            f"{p['reference_date'].strftime('%Y-%m-%d'):>12}"
+            f"{p['period1_end'].strftime('%Y-%m-%d'):>14}"
+            f"{p2_str:>14}"
+            f"{'yes' if reachable else 'no':>11}"
+        )
+    if n_available:
+        print(f"\n{n_reachable} of {n_available} evaluable candidates reachable by their next period.")
+    print("* period 2 end is capped at the ephemeris's coverage end -- no real second close approach on file within it.")
 
 
 def plot_comparison(results: list[dict], out_path: str) -> None:
@@ -308,6 +469,10 @@ def main() -> None:
     parser.add_argument("--step-days", type=float, default=5.0)
     parser.add_argument("--min-tof-days", type=float, default=60.0)
     parser.add_argument("--max-tof-days", type=float, default=900.0)
+    parser.add_argument(
+        "--max-c3-next-period", type=float, default=30.0,
+        help="C3 threshold (km^2/s^2) for the 'reachable by next period' statistic",
+    )
     parser.add_argument("--out-prefix", default="asteroid_comparison")
     args = parser.parse_args()
 
@@ -337,6 +502,7 @@ def main() -> None:
             step_days=args.step_days,
             min_tof_days=args.min_tof_days,
             max_tof_days=args.max_tof_days,
+            max_c3_next_period=args.max_c3_next_period,
         )
         if r is not None:
             results.append(r)
@@ -347,6 +513,7 @@ def main() -> None:
     print()
     print_table(results)
     print_tof_stats(results)
+    print_next_period_stats(results, args.max_c3_next_period)
 
     csv_path = f"{args.out_prefix}.csv"
     png_path = f"{args.out_prefix}.png"
