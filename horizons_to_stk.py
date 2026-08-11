@@ -38,7 +38,6 @@ class EphemPoint:
     vz: float
 
 
-<<<<<<< HEAD
 def parse_horizons_target_name(path: str) -> str | None:
     """Pull the ``Target body name:`` line out of a Horizons text file.
 
@@ -56,8 +55,6 @@ def parse_horizons_target_name(path: str) -> str | None:
     return None
 
 
-=======
->>>>>>> b494f00317a322924ec1763d3bebb5c409bf1bb3
 def parse_horizons_vectors(path: str) -> list[EphemPoint]:
     """Parse the $$SOE / $$EOE vector block of a Horizons Type-3 text file.
 

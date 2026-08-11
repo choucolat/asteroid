@@ -328,7 +328,8 @@ def solve_porkchop(
 
     v1, v2 = lambert_universal(r1, r2, tof, mu=mu, prograde=prograde)
 
-    dv_departure = np.linalg.norm(v1 - v1_body, axis=-1)
+    v_inf_departure = v1 - v1_body
+    dv_departure = np.linalg.norm(v_inf_departure, axis=-1)
     dv_arrival = np.linalg.norm(v2_body - v2, axis=-1)
 
     return {
@@ -339,7 +340,92 @@ def solve_porkchop(
         "tof_days": tof / DAY,
         "launch_jd": launch_jd,
         "arrival_jd": arrival_jd,
+        # Heliocentric departure v_infinity vector (km/s), same ICRF frame as
+        # the ephemerides -- this is what launch_asymptote_radec() below
+        # needs to work out which parking-orbit inclinations can reach it.
+        "v_inf_departure": v_inf_departure,
     }
+
+
+# ---------------------------------------------------------------------------
+# Earth departure: parking orbit / injection burn
+# ---------------------------------------------------------------------------
+# Everything above this point (Lambert, the porkchop grids) treats departure
+# and arrival as instantaneous impulses applied directly to a heliocentric
+# state -- the classic patched-conic porkchop scope. It says nothing about
+# how a real spacecraft actually gets onto that departure hyperbola: it has
+# to first be placed in an Earth parking orbit by the launch vehicle, then
+# perform an injection burn that raises the parking orbit into the escape
+# trajectory. The functions below add that missing piece, restricted to a
+# circular LEO parking orbit (not MEO/GEO -- escape injection is always
+# cheaper from a low orbit thanks to the Oberth effect, so nobody actually
+# parks higher on purpose before escaping) and a single tangential injection
+# burn at the parking-orbit radius (i.e. injection at perigee, the standard
+# and Oberth-efficient case). It does not model launch-vehicle ascent,
+# finite-burn losses, or L2/three-body departure -- see the parking-orbit
+# conversation for why L2 is a separate, much bigger effort (CR3BP dynamics,
+# not the two-body Earth-centred physics used here).
+
+#: Earth gravitational parameter, km^3/s^2 (WGS84).
+MU_EARTH = 398600.4418
+#: Earth equatorial radius, km (WGS84).
+R_EARTH = 6378.137
+
+
+def parking_orbit_speed(
+    altitude_km: np.ndarray, mu: float = MU_EARTH, r_earth: float = R_EARTH
+) -> np.ndarray:
+    """Circular orbital speed (km/s) at the given altitude above Earth."""
+    r = r_earth + np.asarray(altitude_km, dtype=float)
+    return np.sqrt(mu / r)
+
+
+def injection_dv(
+    c3: np.ndarray,
+    altitude_km: float,
+    mu: float = MU_EARTH,
+    r_earth: float = R_EARTH,
+) -> np.ndarray:
+    """Impulsive injection delta-v (km/s) from a circular parking orbit at
+    ``altitude_km`` onto an escape trajectory with the given ``c3``
+    (km^2/s^2), for a single tangential burn at the parking-orbit radius.
+
+    ``vis-viva`` gives the required speed at that radius on the hyperbolic
+    (or parabolic/elliptic, if c3 <= 0) escape trajectory; the injection
+    delta-v is the difference between that and the parking orbit's own
+    circular speed.
+    """
+    c3 = np.asarray(c3, dtype=float)
+    r = r_earth + altitude_km
+    v_park = np.sqrt(mu / r)
+    v_hyp = np.sqrt(c3 + 2.0 * mu / r)
+    return v_hyp - v_park
+
+
+def launch_asymptote_radec(v_inf: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Right ascension and declination (deg) of the outgoing hyperbolic
+    excess velocity vector ``v_inf`` (..., 3), in the same equatorial-aligned
+    frame as the supplied ephemerides (ICRF, which is aligned with Earth's
+    mean equator and equinox to within ~23 mas -- see horizons_to_stk.py's
+    docstring). The declination (DLA) is what matters for parking-orbit
+    reachability: a parking orbit of inclination ``i`` can directly reach
+    (via a single injection burn, no separate plane-change burn) any
+    departure asymptote with declination in ``[-i, i]``, since that's the
+    range of latitudes its ground track ever crosses.
+    """
+    v_inf = np.asarray(v_inf, dtype=float)
+    vnorm = np.linalg.norm(v_inf, axis=-1)
+    dec = np.degrees(np.arcsin(np.clip(v_inf[..., 2] / vnorm, -1.0, 1.0)))
+    ra = np.degrees(np.arctan2(v_inf[..., 1], v_inf[..., 0])) % 360.0
+    return ra, dec
+
+
+def launch_reachable(dla_deg: np.ndarray, inclination_deg: float) -> np.ndarray:
+    """True where a parking orbit of ``inclination_deg`` can directly reach
+    a departure asymptote of declination ``dla_deg`` (see
+    ``launch_asymptote_radec``), i.e. without an extra inclination-change
+    burn on top of the injection burn."""
+    return np.abs(dla_deg) <= abs(inclination_deg)
 
 
 def b_plane_offset(v_inf: np.ndarray, standoff_km: float) -> np.ndarray:

@@ -80,12 +80,26 @@ from porkchop_core import (
     SunCentredEphemeris,
     datetime_to_jd,
     flyby_offset_closest_approach,
+    injection_dv,
     jd_to_datetime,
+    launch_asymptote_radec,
+    launch_reachable,
     solve_flyby_porkchop,
     solve_porkchop,
 )
 
 DAY = 86400.0
+
+# Named parking-orbit shortcuts: (altitude_km, inclination_deg). LEO only --
+# escape injection is always cheaper from a low orbit (Oberth effect), so
+# MEO/GEO parking orbits aren't offered here; see the parking-orbit
+# conversation for the reasoning. --altitude-km/--inclination-deg override
+# these directly if you want a specific combination not listed.
+PARKING_ORBITS: dict[str, tuple[float, float]] = {
+    "leo-equatorial": (200.0, 28.5),   # Cape Canaveral-like, no plane change
+    "leo-iss": (400.0, 51.6),          # ISS-like inclination
+    "sun-sync": (700.0, 98.0),         # polar / sun-synchronous
+}
 
 # Real discovery dates (SBDB "discovery.date", or "orbit.first_obs" where no
 # formal discovery-credit record exists) and real Earth close-approach dates
@@ -180,6 +194,52 @@ def next_period_reachability(
         "best_c3_in_window": best_c3,
     }
 
+def parking_orbit_analysis(
+    v_inf_departure: np.ndarray,
+    c3: np.ndarray,
+    solved: np.ndarray,
+    launch_jd: np.ndarray,
+    arrival_jd: np.ndarray,
+    i_int: tuple,
+    altitude_km: float,
+    inclination_deg: float,
+) -> dict:
+    """Injection delta-v and launch-site reachability for a given LEO
+    parking orbit, both at the unconstrained min-C3 point (``i_int``, the
+    same point the "best intercept" figures elsewhere report) and at the
+    best point that's actually reachable from this parking-orbit
+    inclination without an extra plane-change burn -- these can differ,
+    since the cheapest C3 solution isn't necessarily launchable from a given
+    site/inclination on that date. See porkchop_core.injection_dv /
+    launch_asymptote_radec for the underlying physics.
+    """
+    _, dla = launch_asymptote_radec(v_inf_departure)
+    reachable = launch_reachable(dla, inclination_deg)
+    inj_dv = injection_dv(c3, altitude_km)
+
+    out = {
+        "altitude_km": altitude_km,
+        "inclination_deg": inclination_deg,
+        "injection_dv_at_best_c3": float(inj_dv[i_int]),
+        "dla_at_best_c3": float(dla[i_int]),
+        "reachable_at_best_c3": bool(reachable[i_int]),
+        "best_reachable_available": False,
+    }
+
+    mask = solved & reachable
+    if np.any(mask):
+        i_park = np.unravel_index(np.argmin(np.where(mask, inj_dv, np.inf)), inj_dv.shape)
+        out.update(
+            best_reachable_available=True,
+            best_reachable_launch=jd_to_datetime(launch_jd[i_park[1]]),
+            best_reachable_arrival=jd_to_datetime(arrival_jd[i_park[0]]),
+            best_reachable_c3=float(c3[i_park]),
+            best_reachable_injection_dv=float(inj_dv[i_park]),
+        )
+
+    return out
+
+
 #: Bar colours, reused from plot_porkchop.py's palette choices.
 COL_C3 = "#1f2937"
 COL_VINF = "#c2610c"
@@ -212,6 +272,8 @@ def analyze_asteroid(
     min_tof_days: float,
     max_tof_days: float,
     max_c3_next_period: float,
+    park_altitude_km: float,
+    park_inclination_deg: float,
 ) -> dict | None:
     """Run intercept / flyby / rendezvous solves over an auto-derived grid.
 
@@ -295,6 +357,11 @@ def analyze_asteroid(
     )
     out["next_period"] = period
 
+    out["parking_orbit"] = parking_orbit_analysis(
+        res["v_inf_departure"], c3, solved, launch_jd, arrival_jd, i_int,
+        park_altitude_km, park_inclination_deg,
+    )
+
     return out
 
 
@@ -308,12 +375,18 @@ def write_csv(results: list[dict], path: str) -> None:
         "next_period_available", "next_period_reference", "next_period1_end",
         "next_period2_end", "next_period2_capped_by_data",
         "next_period_reachable", "next_period_best_c3",
+        "park_altitude_km", "park_inclination_deg",
+        "park_injection_dv_at_best_c3", "park_dla_at_best_c3", "park_reachable_at_best_c3",
+        "park_best_reachable_available", "park_best_reachable_launch",
+        "park_best_reachable_arrival", "park_best_reachable_c3",
+        "park_best_reachable_injection_dv",
     ]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(fields)
         for r in results:
             p = r.get("next_period", {})
+            po = r.get("parking_orbit", {})
             flat = dict(r)
             flat["next_period_available"] = p.get("available", False)
             flat["next_period_reference"] = p.get("reference_date")
@@ -322,6 +395,16 @@ def write_csv(results: list[dict], path: str) -> None:
             flat["next_period2_capped_by_data"] = p.get("period2_capped_by_data", "")
             flat["next_period_reachable"] = p.get("reachable", "")
             flat["next_period_best_c3"] = p.get("best_c3_in_window", np.nan)
+            flat["park_altitude_km"] = po.get("altitude_km")
+            flat["park_inclination_deg"] = po.get("inclination_deg")
+            flat["park_injection_dv_at_best_c3"] = po.get("injection_dv_at_best_c3", np.nan)
+            flat["park_dla_at_best_c3"] = po.get("dla_at_best_c3", np.nan)
+            flat["park_reachable_at_best_c3"] = po.get("reachable_at_best_c3", "")
+            flat["park_best_reachable_available"] = po.get("best_reachable_available", False)
+            flat["park_best_reachable_launch"] = po.get("best_reachable_launch")
+            flat["park_best_reachable_arrival"] = po.get("best_reachable_arrival")
+            flat["park_best_reachable_c3"] = po.get("best_reachable_c3", np.nan)
+            flat["park_best_reachable_injection_dv"] = po.get("best_reachable_injection_dv", np.nan)
             row = []
             for k in fields:
                 v = flat.get(k)
@@ -407,6 +490,46 @@ def print_next_period_stats(results: list[dict], max_c3: float) -> None:
     print("* period 2 end is capped at the ephemeris's coverage end -- no real second close approach on file within it.")
 
 
+def print_parking_orbit_stats(results: list[dict]) -> None:
+    if not results:
+        return
+    po0 = results[0]["parking_orbit"]
+    print(
+        f"\nParking orbit: {po0['altitude_km']:g} km altitude, "
+        f"{po0['inclination_deg']:g} deg inclination "
+        "(injection dv for a single tangential burn onto each transfer's "
+        "C3; 'direct?' = whether that C3 point's departure asymptote "
+        "declination is within the parking orbit's inclination, i.e. "
+        "reachable without a separate plane-change burn):"
+    )
+    hdr = (
+        f"{'asteroid':<20}{'inj dv @ best C3':>17}{'DLA':>8}{'direct?':>9}"
+        f"{'best direct inj dv':>20}"
+    )
+    print(hdr)
+    print("-" * len(hdr))
+    n_direct = 0
+    for r in results:
+        po = r["parking_orbit"]
+        n_direct += int(po["reachable_at_best_c3"])
+        if po["best_reachable_available"]:
+            best = f"{po['best_reachable_injection_dv']:.3f} km/s"
+        else:
+            best = "none in grid"
+        print(
+            f"{r['name']:<20}{po['injection_dv_at_best_c3']:>14.3f} km/s"
+            f"{po['dla_at_best_c3']:>7.1f}°"
+            f"{'yes' if po['reachable_at_best_c3'] else 'no':>9}"
+            f"{best:>20}"
+        )
+    print(
+        f"\n{n_direct} of {len(results)} candidates' cheapest-C3 transfer is "
+        "directly launchable from this parking orbit without a plane-change "
+        "burn; for the rest, see the 'best direct inj dv' column for the "
+        "cheapest transfer that actually is."
+    )
+
+
 def plot_comparison(results: list[dict], out_path: str) -> None:
     names = [r["name"] for r in results]
     c3 = [r["int_c3"] for r in results]
@@ -473,8 +596,18 @@ def main() -> None:
         "--max-c3-next-period", type=float, default=30.0,
         help="C3 threshold (km^2/s^2) for the 'reachable by next period' statistic",
     )
+    parser.add_argument(
+        "--parking-orbit", choices=sorted(PARKING_ORBITS), default=None,
+        help=f"named parking orbit preset: {', '.join(sorted(PARKING_ORBITS))} "
+             "(overrides --altitude-km/--inclination-deg)",
+    )
+    parser.add_argument("--altitude-km", type=float, default=400.0)
+    parser.add_argument("--inclination-deg", type=float, default=28.5)
     parser.add_argument("--out-prefix", default="asteroid_comparison")
     args = parser.parse_args()
+
+    if args.parking_orbit:
+        args.altitude_km, args.inclination_deg = PARKING_ORBITS[args.parking_orbit]
 
     earth = SunCentredEphemeris(args.earth, "Earth")
     print(earth)
@@ -503,6 +636,8 @@ def main() -> None:
             min_tof_days=args.min_tof_days,
             max_tof_days=args.max_tof_days,
             max_c3_next_period=args.max_c3_next_period,
+            park_altitude_km=args.altitude_km,
+            park_inclination_deg=args.inclination_deg,
         )
         if r is not None:
             results.append(r)
@@ -514,6 +649,7 @@ def main() -> None:
     print_table(results)
     print_tof_stats(results)
     print_next_period_stats(results, args.max_c3_next_period)
+    print_parking_orbit_stats(results)
 
     csv_path = f"{args.out_prefix}.csv"
     png_path = f"{args.out_prefix}.png"
