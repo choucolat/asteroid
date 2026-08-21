@@ -51,8 +51,8 @@ from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
-HORIZONS_FILE = HERE / "horizons_results.txt"
-EPHEMERIS_FILE = HERE / "yr4.e"
+HORIZONS_FILE = HERE / "horizons_2024_yr4.txt"
+EPHEMERIS_FILE = HERE / "2024_yr4.e"
 
 # Scenario analysis interval -- must span every epoch queried below and stay
 # inside the ephemeris written by horizons_to_stk.py.
@@ -60,9 +60,15 @@ SCENARIO_START = "2 Jan 2023 00:00:00.000"
 SCENARIO_STOP = "20 Dec 2029 00:00:00.000"
 
 # Sweep centred on the December 2028 Earth close approach.
-FIRST_LAUNCH, LAST_LAUNCH = "01 Aug 2027", "25 Nov 2028"
-FIRST_ARRIVAL, LAST_ARRIVAL = "15 Jul 2028", "15 Mar 2029"
-GRID_STEP_DAYS = 5
+FIRST_LAUNCH, LAST_LAUNCH = "30 Nov 2025", "01 Jan 2028"   # First launch "01 Aug 2027"
+FIRST_ARRIVAL, LAST_ARRIVAL = "01 Feb 2027", "31 Jul 2029"  #First arrival "15 Jul 2028"
+GRID_STEP_DAYS = 10
+
+# Set to True to additionally render porkchop plots from the STK-derived
+# dv_arrival_values / c3_launch_values grids: launch C3 (with arrival dv
+# isolines) and total mission dv (with launch dv isolines), both with time-
+# of-flight isolines, styled like plot_porkchop.py.
+GENERATE_PORKCHOP_PLOTS = True
 # -
 
 # ## Build the external ephemeris for 2024 YR4
@@ -87,7 +93,7 @@ if not EPHEMERIS_FILE.exists():
 from ansys.stk.core.stkengine import STKEngine
 
 
-stk = STKEngine.start_application(no_graphics=True)
+stk = STKEngine.start_application(no_graphics=False)
 print(f"Using {stk.version}")
 # -
 
@@ -422,9 +428,12 @@ def lambert_solver(
 
     Returns
     -------
-    tuple(float, float, float)
-        Departure impulse (km/s), arrival impulse (km/s) and time of flight (s).
-        The impulses are ``nan`` when no transfer exists or STK fails to solve.
+    tuple(float, float, float, float, float, float, str, str)
+        Departure impulse (km/s), arrival impulse (km/s), time of flight (s),
+        the Cartesian components of the departure impulse (km/s), and the
+        thrust axes names of the first and last impulse.
+        All values are ``nan``/``None`` (except time of flight) when no
+        transfer exists or STK fails to solve.
     """
     # Retrieve the segments and lambert profile from the satellite
     main_sequence = satellite.propagator.main_sequence
@@ -437,7 +446,7 @@ def lambert_solver(
     # Compute the time of flight
     time_of_flight = arrival_date.span(launch_date).value
     if time_of_flight <= 0:
-        return np.nan, np.nan, time_of_flight
+        return np.nan, np.nan, time_of_flight, np.nan, np.nan, np.nan, None, None
     lambert.time_of_flight = time_of_flight
 
     # Compute the departure and arrival state vectors
@@ -491,10 +500,23 @@ def lambert_solver(
         satellite.propagator.apply_all_profile_changes()
         delta_v1 = first_impulse.maneuver.attitude_control.magnitude / 1000
         delta_v2 = last_impulse.maneuver.attitude_control.magnitude / 1000
+        delta_v1_x = first_impulse.maneuver.attitude_control.x / 1000
+        delta_v1_y = first_impulse.maneuver.attitude_control.y / 1000
+        delta_v1_z = first_impulse.maneuver.attitude_control.z / 1000
+        first_thrust_axes = first_impulse.maneuver.attitude_control.thrust_axes_name
+        last_thrust_axes = last_impulse.maneuver.attitude_control.thrust_axes_name
     except Exception:
-        return np.nan, np.nan, time_of_flight
-
-    return delta_v1, delta_v2, time_of_flight
+        return np.nan, np.nan, time_of_flight, np.nan, np.nan, np.nan, None, None
+    return (
+        delta_v1,
+        delta_v2,
+        time_of_flight,
+        delta_v1_x,
+        delta_v1_y,
+        delta_v1_z,
+        first_thrust_axes,
+        last_thrust_axes,
+    )
 
 
 # -
@@ -508,6 +530,11 @@ import time
 dv_arrival_values = np.full((len(arrival_span), len(launch_span)), np.nan)
 c3_launch_values = np.full((len(arrival_span), len(launch_span)), np.nan)
 tof_values = np.full((len(arrival_span), len(launch_span)), np.nan)
+dv_launch_x_values = np.full((len(arrival_span), len(launch_span)), np.nan)
+dv_launch_y_values = np.full((len(arrival_span), len(launch_span)), np.nan)
+dv_launch_z_values = np.full((len(arrival_span), len(launch_span)), np.nan)
+first_thrust_axes_values = np.full((len(arrival_span), len(launch_span)), None, dtype=object)
+last_thrust_axes_values = np.full((len(arrival_span), len(launch_span)), None, dtype=object)
 
 total = len(launch_span) * len(arrival_span)
 started = time.time()
@@ -515,13 +542,27 @@ print(f"\nSolving {total:,} launch/arrival combinations...")
 
 for i, launch_date in enumerate(launch_span):
     for j, arrival_date in enumerate(arrival_span):
-        dv_launch, dv_arrival, tof = lambert_solver(
-            satellite, earth, yr4, launch_date, arrival_date
+        (
+            dv_launch,
+            dv_arrival,
+            tof,
+            delta_v1_x,
+            delta_v1_y,
+            delta_v1_z,
+            first_thrust_axes,
+            last_thrust_axes,
+        ) = lambert_solver(
+            satellite, earth, yr4, launch_date, arrival_date, is_prograde=True
         )
 
         dv_arrival_values[j, i] = dv_arrival
         c3_launch_values[j, i] = dv_launch**2
         tof_values[j, i] = tof / 3600 / 24
+        dv_launch_x_values[j, i] = delta_v1_x
+        dv_launch_y_values[j, i] = delta_v1_y
+        dv_launch_z_values[j, i] = delta_v1_z
+        first_thrust_axes_values[j, i] = first_thrust_axes
+        last_thrust_axes_values[j, i] = last_thrust_axes
 
     done = (i + 1) * len(arrival_span)
     elapsed = time.time() - started
@@ -540,8 +581,175 @@ if solved.any():
         c3_launch_values.shape,
     )
     print(
-        f"Minimum C3 = {c3_launch_values[k]:.3f} km^2/s^2 for launch "
+        f"Minimum C3 = {c3_launch_values[k]:.6f} km^2/s^2 for launch "
         f"{launch_span[k[1]].format('UTCG')[:11]} / arrival "
         f"{arrival_span[k[0]].format('UTCG')[:11]} (TOF {tof_values[k]:.0f} d, "
-        f"arrival v_inf {dv_arrival_values[k]:.2f} km/s)"
+        f"arrival d_v {dv_arrival_values[k]:.2f} km/s, "
+        f"c3 {c3_launch_values[k]:.6f} km^2/s^2, "
+        f"launch d_v {np.sqrt(c3_launch_values[k]):.2f} km/s, "
+        f"launch d_v vector [{dv_launch_x_values[k]:.2f}, {dv_launch_y_values[k]:.2f}, {dv_launch_z_values[k]:.2f}] km/s)"
     )
+    # Also state the minimum arrival delta-v, which is the more relevant metric for a small asteroid rendezvous.
+    j = np.unravel_index(
+            np.nanargmin(np.where(solved & (tof_values > 60), dv_arrival_values, np.inf)),
+            dv_arrival_values.shape,
+    )
+    print(
+        f"Minimum arrival delta-v = {dv_arrival_values[j]:.2f} km/s for launch "
+        f"{launch_span[j[1]].format('UTCG')[:11]} / arrival "
+        f"{arrival_span[j[0]].format('UTCG')[:11]} (TOF {tof_values[j]:.0f} d, "
+        f"arrival d_v {dv_arrival_values[j]:.2f} km/s, "
+        f"c3 {c3_launch_values[j]:.6f} km^2/s^2, "
+        f"launch d_v {np.sqrt(c3_launch_values[j]):.2f} km/s, "
+        f"launch d_v vector [{dv_launch_x_values[j]:.2f}, {dv_launch_y_values[j]:.2f}, {dv_launch_z_values[j]:.2f}] km/s, "
+        f"first thrust axes {first_thrust_axes_values[j]}, last thrust axes {last_thrust_axes_values[j]})"
+    )
+
+# ## Optional porkchop plots
+#
+# Reuses the plotting helpers from plot_porkchop.py (draw_porkchop, mark,
+# callout) so the STK-derived grids render with the same style -- filled
+# contours, isolines, legend, and a summary callout box -- as the standalone
+# NumPy cross-check. Gated behind GENERATE_PORKCHOP_PLOTS since it pulls in
+# matplotlib and forces the Agg backend, neither of which the sweep above
+# needs.
+
+if GENERATE_PORKCHOP_PLOTS:
+    import datetime as dt
+
+    import matplotlib as mpl
+
+    mpl.use("Agg")
+
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    from plot_porkchop import callout, draw_porkchop, mark
+
+    def stk_date_to_datetime(date) -> dt.datetime:
+        """Convert an STK ``Date`` (UTCG) to a naive UTC ``datetime``."""
+        return dt.datetime.strptime(date.format("UTCG"), "%d %b %Y %H:%M:%S.%f")
+
+    launch_dates = np.array([stk_date_to_datetime(d) for d in launch_span])
+    arrival_dates = np.array([stk_date_to_datetime(d) for d in arrival_span])
+
+    dv_launch_values = np.sqrt(c3_launch_values)
+    dv_total_values = dv_launch_values + dv_arrival_values
+
+    # Same "reachable" filter used for the console minima above: a near-zero
+    # time of flight is a degenerate Lambert solution, not a real transfer.
+    reachable = solved & (tof_values > 60)
+
+    def _regular_levels(field, n=8):
+        finite = field[np.isfinite(field)]
+        if finite.size == 0:
+            return np.array([])
+        lo, hi = np.nanmin(finite), np.nanmax(finite)
+        if lo == hi:
+            return np.array([lo])
+        return np.linspace(lo, hi, n)
+
+    tof_levels = _regular_levels(tof_values, 8)
+
+    # --- Figure 1: launch C3, with arrival dv and TOF isolines -------------
+    if reachable.any():
+        c3_levels = np.arange(0, 130000 + 20000, 5000)
+        dv_levels = _regular_levels(dv_arrival_values, 6)
+        i_c3 = np.unravel_index(
+            np.nanargmin(np.where(reachable, c3_launch_values, np.inf)),
+            c3_launch_values.shape,
+        )
+
+        fig, ax = plt.subplots(figsize=(13.5, 9.5))
+        ax.set_title(
+            "EARTH → (2024 YR4)   BALLISTIC TRANSFER TRAJECTORY (STK Astrogator)\n"
+            "Launch characteristic energy $C_3$ — Lambert profile solved by STK",
+            fontsize=13,
+            pad=14,
+        )
+        filled = draw_porkchop(
+            ax,
+            launch_dates,
+            arrival_dates,
+            c3_launch_values,
+            c3_levels,
+            "$C_3$ launch",
+            dv_arrival_values,
+            dv_levels,
+            tof_values,
+            tof_levels,
+            dv_label="Arrival $\\Delta v$",
+        )
+        cbar = fig.colorbar(filled, ax=ax, pad=0.015, fraction=0.04, extend="max")
+        cbar.set_label("Launch characteristic energy $C_3$  [km$^2$/s$^2$]")
+        mark(ax, launch_dates[i_c3[1]], arrival_dates[i_c3[0]])
+        callout(
+            ax,
+            f"minimum $C_3$ = {c3_launch_values[i_c3]:.3f} km$^2$/s$^2$\n"
+            f"launch  {launch_dates[i_c3[1]]:%d %b %Y}\n"
+            f"arrive  {arrival_dates[i_c3[0]]:%d %b %Y}\n"
+            f"time of flight  {tof_values[i_c3]:.0f} d\n"
+            f"launch $\\Delta v$  {dv_launch_values[i_c3]:.2f} km/s\n"
+            f"arrival $\\Delta v$  {dv_arrival_values[i_c3]:.2f} km/s",
+        )
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.yaxis.set_major_locator(mdates.AutoDateLocator())
+        c3_plot_path = HERE / "porkchop_yr4_stk_c3.png"
+        fig.savefig(c3_plot_path, dpi=160, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Wrote {c3_plot_path}")
+    else:
+        print("Skipping C3 plot: no reachable (TOF > 60 d) solutions in the grid.")
+
+    # --- Figure 2: total mission dv, with launch dv and TOF isolines -------
+    if reachable.any():
+        # Fixed range/step rather than data-driven: values above the top
+        # level are clipped to the last color via BoundaryNorm + extend="max"
+        # in draw_porkchop (cmap.set_over), not rescaled to the data max.
+        tot_levels = np.arange(0, 265 + 20, 20)
+        dvl_levels = _regular_levels(dv_launch_values, 6)
+        i_tot = np.unravel_index(
+            np.nanargmin(np.where(reachable, dv_total_values, np.inf)),
+            dv_total_values.shape,
+        )
+
+        fig, ax = plt.subplots(figsize=(13.5, 9.5))
+        ax.set_title(
+            "EARTH → (2024 YR4)   RENDEZVOUS TRANSFER (STK Astrogator)\n"
+            "Total mission $\\Delta v = \\Delta v_{launch} + \\Delta v_{arrival}$",
+            fontsize=13,
+            pad=14,
+        )
+        filled = draw_porkchop(
+            ax,
+            launch_dates,
+            arrival_dates,
+            dv_total_values,
+            tot_levels,
+            "Total $\\Delta v$",
+            dv_launch_values,
+            dvl_levels,
+            tof_values,
+            tof_levels,
+            dv_label="Launch $\\Delta v$",
+        )
+        cbar = fig.colorbar(filled, ax=ax, pad=0.015, fraction=0.04, extend="max")
+        cbar.set_label("Total mission $\\Delta v$  [km/s]")
+        mark(ax, launch_dates[i_tot[1]], arrival_dates[i_tot[0]])
+        callout(
+            ax,
+            f"minimum total $\\Delta v$ = {dv_total_values[i_tot]:.2f} km/s\n"
+            f"launch  {launch_dates[i_tot[1]]:%d %b %Y}\n"
+            f"arrive  {arrival_dates[i_tot[0]]:%d %b %Y}\n"
+            f"launch $\\Delta v$  {dv_launch_values[i_tot]:.2f} km/s\n"
+            f"arrival $\\Delta v$  {dv_arrival_values[i_tot]:.2f} km/s\n"
+            f"time of flight  {tof_values[i_tot]:.0f} d",
+        )
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.yaxis.set_major_locator(mdates.AutoDateLocator())
+        total_dv_plot_path = HERE / "porkchop_yr4_stk_total_dv.png"
+        fig.savefig(total_dv_plot_path, dpi=160, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Wrote {total_dv_plot_path}")
+    else:
+        print("Skipping total dv plot: no reachable (TOF > 60 d) solutions in the grid.")
